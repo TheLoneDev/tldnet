@@ -39,13 +39,15 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #elif PLATFORM_WINDOWS
-#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#if defined(_MSC_VER) && NO_WS2_LINK
+#include <windows.h>
+#if defined(_MSC_VER) && !NO_WS2_LINK
 #pragma comment (lib, "Ws2_32.lib")
+#pragma comment (lib, "Mswsock.lib")
+#pragma comment (lib, "AdvApi32.lib")
 #endif
-else
+#else
 #error This platform is unsupported
 #endif
 
@@ -65,7 +67,7 @@ namespace tldnet
             NULL_SOCKET, FAILED_SEND, FAILED_READ
         };
 
-        template<SocketError SOCKET_ERROR>
+        template<SocketError SOCK_ERROR>
         class SocketException : public std::runtime_error{};
 
         template<>
@@ -450,19 +452,14 @@ namespace tldnet
 
     inline constexpr bool IsLittleEndian()
     { 
-    #if __BYTE_ORDER__ == __ORDER_PDP_ENDIAN__
+    #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_PDP_ENDIAN__
         #error PDP Byte order is unsupported
-    #endif
-    #if !defined(__BYTE_ORDER__) || !defined(__ORDER_LITTLE_ENDIAN__)
-        if constexpr (IsLittleEndian())
-        const int val { 0x01 };
-        const void * addr {static_cast<const void*>(&val)};
-        const unsigned char* lsaddr { static_cast<const unsigned char*>(addr) };
-
-        return (*lsaddr) == 0x01;
+    #elif !defined(__BYTE_ORDER__) || !defined(__ORDER_LITTLE_ENDIAN__)
+        return 'ABCD' == 0x41424344UL;
     #else
         return __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
     #endif
+        
     } 
     // This htons function is probably necessary as it's not guranteed that
     // The Regular unix/windows htons will be constexpr
@@ -664,9 +661,11 @@ namespace tldnet
 
         if(getaddrinfo(host.GetHostname().data(), nullptr, &hints, &res) != 0 || !res || !res->ai_addr)
             return; // Assuming m_Valid = false;
-
-
+#if PLATFORM_WINDOWS
+        auto* addrArray = reinterpret_cast<sockaddr_in6*>(res->ai_addr)->sin6_addr.u.Word;
+#else
         auto* addrArray = reinterpret_cast<sockaddr_in6*>(res->ai_addr)->sin6_addr.__in6_u.__u6_addr16;
+#endif
         m_Address[0] = (static_cast<uint64_t>(addrArray[0]) << 48) | (static_cast<uint64_t>(addrArray[1]) << 32) | (static_cast<uint64_t>(addrArray[2]) << 16) | addrArray[3];
         m_Address[1] = (static_cast<uint64_t>(addrArray[4]) << 48) | (static_cast<uint64_t>(addrArray[5]) << 32) | (static_cast<uint64_t>(addrArray[6]) << 16) | addrArray[7];
 
@@ -679,6 +678,19 @@ bool tldnet::SocketBase<IPVER, PROTOCOL>::Init()
 {
     // constexpr auto IPFAM = IPVER == IPVer::IPV4 ? AF_INET : AF_INET6;
     // No need for this^, since now IPV4 == AF_INET and IPV6 == AF_INET6.
+
+#if PLATFORM_WINDOWS
+    static bool WinSock_Init = false;
+
+    if (!WinSock_Init)
+    {
+        static WSADATA wsaData = {};
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData))
+            return false;
+
+        WinSock_Init = true;
+    }
+#endif
     
     if constexpr(PROTOCOL == Protocols::TCP)
     {
@@ -711,22 +723,33 @@ bool tldnet::SocketBase<IPVER, PROTOCOL>::Init()
                 to.tv_sec = this->m_Timeout / 1000;
                 to.tv_usec = this->m_Timeout % 1000 * 1000;
             }
-
+#if PLATFORM_WINDOWS
+            if (setsockopt(this->m_Socket, SOL_SOCKET, mode, reinterpret_cast<const char*>(&to), sizeof(to)) < 0)
+#else
             if(setsockopt(this->m_Socket, SOL_SOCKET, mode ,&to, sizeof(to)) < 0)
+#endif
                 return false;
         }
     }
 
     if(this->IsTTLSet())
     {
+#if PLATFORM_WINDOWS
+        if (setsockopt(this->m_Socket, IPPROTO_IP, IP_TTL, reinterpret_cast<const char*>(&this->m_TTL), sizeof(this->m_TTL)) < 0)
+#else
         if(setsockopt(this->m_Socket, IPPROTO_IP, IP_TTL, &this->m_TTL, sizeof(this->m_TTL)) < 0)
+#endif
             return false;
     }
 
     if(this->IsBroadcastEnabled())
     {
         constexpr int boolTrue = true;
+#if PLATFORM_WINDOWS
+        if (setsockopt(this->m_Socket, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&boolTrue), sizeof(boolTrue)) < 0)
+#else
         if(setsockopt(this->m_Socket, SOL_SOCKET, SO_BROADCAST, &boolTrue, sizeof(boolTrue)) < 0)
+#endif
             return false;
     }
     
@@ -739,7 +762,7 @@ tldnet::OpResult tldnet::SocketBase<IPVER, PROTOCOL>::Send(const uint8_t* buffer
     if(!m_Socket || !buffer || !nBytes)
         return OpResult::FAILED;
 
-    auto res = send(m_Socket, buffer, nBytes, 0);
+    auto res = send(m_Socket, reinterpret_cast<char*>(buffer), nBytes, 0);
     if(res > 0)
         return OpResult::OK;
     else if(res == 0)
@@ -754,7 +777,7 @@ tldnet::OpResult tldnet::SocketBase<IPVER, PROTOCOL>::Read(uint8_t* buffer, std:
     if(!m_Socket || !buffer || !nBytes)
         return OpResult::FAILED;
 
-    auto res = recv(m_Socket, buffer, nBytes, 0);
+    auto res = recv(m_Socket, reinterpret_cast<char*>(buffer), nBytes, 0);
 
     if(res > 0)
         return OpResult::OK;
@@ -846,8 +869,13 @@ tldnet::SocketBase<IPVER, PROTOCOL>::~SocketBase()
 {
     if(m_Socket)
     {
+#if PLATFORM_WINDOWS
+        shutdown(m_Socket, SD_BOTH);
+        closesocket(m_Socket);
+#else
         shutdown(m_Socket, SHUT_RDWR);
         close(m_Socket);
+#endif
         m_Socket = 0;
     }
 }
@@ -874,13 +902,21 @@ bool tldnet::SocketClient<IPVER, PROTOCOL, BUFF_SIZE>::Connect()
             auto uint16Array = this->m_SockAddrIn.sin6_addr.__in6_u.__u6_addr16;
             uint16Array[i] = i < 4 ? reinterpret_cast<uint16_t*>(&m_Addr.GetAddressPrimitive().Get(0))[i] : reinterpret_cast<uint16_t*>(&m_Addr.GetAddressPrimitive().Get(1))[i-4];
         }
+#if PLATFORM_WINDOWS
+        this->m_SockAddrIn.sin6_family = static_cast<ADDRESS_FAMILY>(IPVER);
+#else
         this->m_SockAddrIn.sin6_family = static_cast<sa_family_t>(IPVER);
+#endif
         this->m_SockAddrIn.sin6_port = Htons(this->m_Port);
     }
     else
     {
         this->m_SockAddrIn.sin_addr.s_addr = m_Addr.GetAddressPrimitive()[0];
+#if PLATFORM_WINDOWS
+        this->m_SockAddrIn.sin_family = static_cast<ADDRESS_FAMILY>(IPVER);
+#else
         this->m_SockAddrIn.sin_family = static_cast<sa_family_t>(IPVER);
+#endif
         this->m_SockAddrIn.sin_port = Htons(this->m_Port);
     }
 
@@ -913,7 +949,11 @@ bool tldnet::SocketServer<IPVER, PROTOCOL, LISTEN_SCOPE, BUFF_SIZE>::Bind()
     constexpr auto listenAddress = LISTEN_SCOPE == ListenScope::LOOPBACK ? INADDR_LOOPBACK : INADDR_ANY;
 
     this->m_SockAddrIn.sin_addr.s_addr = htonl(listenAddress);
+#if PLATFORM_WINDOWS
+    this->m_SockAddrIn.sin_family = static_cast<ADDRESS_FAMILY>(IPVER);
+#else
     this->m_SockAddrIn.sin_family = static_cast<sa_family_t>(IPVER);
+#endif
     this->m_SockAddrIn.sin_port = Htons(this->m_Port);
     //int res = 0; Use when error checking implemented
 
